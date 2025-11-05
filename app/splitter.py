@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-import math
+import posixpath
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import List, Sequence
+from typing import Dict, Iterable, List, Sequence, Set
 from xml.etree import ElementTree as ET
 from copy import deepcopy
 import zipfile
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 
 
 def qn(tag: str) -> str:
@@ -49,11 +51,23 @@ def split_docx_by_size(docx_bytes: bytes, target_size_mb: float, original_name: 
                 document_xml = docx_zip.read("word/document.xml")
             except KeyError as exc:
                 raise DocxSplitError("DOCX 문서 구조를 확인할 수 없습니다.") from exc
-            template_files = {
-                name: docx_zip.read(name)
-                for name in docx_zip.namelist()
-                if name != "word/document.xml"
-            }
+
+            try:
+                rels_xml = docx_zip.read("word/_rels/document.xml.rels")
+                relationships_root = ET.fromstring(rels_xml)
+            except KeyError:
+                relationships_root = None
+
+            static_files: Dict[str, bytes] = {}
+            heavy_files: Dict[str, bytes] = {}
+            for name in docx_zip.namelist():
+                if name in {"word/document.xml", "word/_rels/document.xml.rels"}:
+                    continue
+                data = docx_zip.read(name)
+                if name.startswith("word/media/") or name.startswith("word/embeddings/") or name.startswith("word/charts/"):
+                    heavy_files[name] = data
+                else:
+                    static_files[name] = data
     except zipfile.BadZipFile as exc:
         raise DocxSplitError("유효한 DOCX 파일이 아닙니다.") from exc
 
@@ -66,74 +80,70 @@ def split_docx_by_size(docx_bytes: bytes, target_size_mb: float, original_name: 
     if sect_pr is not None:
         body.remove(sect_pr)
 
-    body_elements = [deepcopy(child) for child in body]
-
     pages = _split_body_into_pages(body)
     if not pages:
-        pages = [body_elements]
+        pages = [[deepcopy(child) for child in body]]
 
     total_size = len(docx_bytes)
-    target_chunks = max(1, math.ceil(total_size / target_bytes))
-
-    if len(pages) < target_chunks:
-        pages = _fallback_grouping(body_elements, target_chunks)
-
-    pages_per_chunk = math.ceil(len(pages) / target_chunks)
-
-    base_tree = tree
-
     base_filename = Path(original_name).stem
     chunks: List[Chunk] = []
 
-    for idx in range(0, len(pages), pages_per_chunk):
-        chunk_pages = pages[idx : idx + pages_per_chunk]
-        if not chunk_pages:
-            continue
-        start_page = idx + 1
-        end_page = idx + len(chunk_pages)
-        elements = [deepcopy(el) for page in chunk_pages for el in page]
+    template = _DocxTemplate(
+        base_tree=tree,
+        sect_pr=sect_pr,
+        static_files=static_files,
+        heavy_files=heavy_files,
+        relationships_root=relationships_root,
+    )
 
-        chunk_tree = deepcopy(base_tree)
-        chunk_body = chunk_tree.find(qn("body"))
-        if chunk_body is None:
-            raise DocxSplitError("문서 본문을 생성하지 못했습니다.")
-        for child in list(chunk_body):
-            chunk_body.remove(child)
-        for element in elements:
-            chunk_body.append(element)
-        if sect_pr is not None:
-            chunk_body.append(deepcopy(sect_pr))
+    current_pages: List[List[ET.Element]] = []
+    current_start = 1
+    cached_bytes: bytes | None = None
 
-        chunk_xml = ET.tostring(chunk_tree, encoding="utf-8", xml_declaration=True)
+    for page_index, page in enumerate(pages, start=1):
+        candidate_pages = current_pages + [page]
+        candidate_bytes = template.render(candidate_pages)
 
-        buffer = BytesIO()
-        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for name, data in template_files.items():
-                archive.writestr(name, data)
-            archive.writestr("word/document.xml", chunk_xml)
-        buffer.seek(0)
+        if (
+            current_pages
+            and len(candidate_pages) > 1
+            and len(candidate_bytes) > target_bytes
+        ):
+            start_page = current_start
+            end_page = current_start + len(current_pages) - 1
+            final_bytes = cached_bytes if cached_bytes is not None else template.render(current_pages)
+            chunk_filename = f"{base_filename}_{start_page:02d}_{end_page:02d}.docx"
+            chunks.append(
+                Chunk(
+                    filename=chunk_filename,
+                    data=final_bytes,
+                    start_page=start_page,
+                    end_page=end_page,
+                )
+            )
+            current_pages = [page]
+            current_start = page_index
+            candidate_bytes = template.render(current_pages)
+        else:
+            current_pages = candidate_pages
 
+        cached_bytes = candidate_bytes
+
+    if current_pages:
+        start_page = current_start
+        end_page = current_start + len(current_pages) - 1
+        final_bytes = cached_bytes if cached_bytes is not None else template.render(current_pages)
         chunk_filename = f"{base_filename}_{start_page:02d}_{end_page:02d}.docx"
         chunks.append(
             Chunk(
                 filename=chunk_filename,
-                data=buffer.getvalue(),
+                data=final_bytes,
                 start_page=start_page,
                 end_page=end_page,
             )
         )
 
     return SplitResult(chunks=chunks, total_pages=len(pages), total_size=total_size)
-
-
-def _fallback_grouping(elements: Sequence[ET.Element], target_chunks: int) -> List[List[ET.Element]]:
-    if not elements:
-        return [[]]
-    chunk_size = max(1, math.ceil(len(elements) / target_chunks))
-    grouped: List[List[ET.Element]] = []
-    for idx in range(0, len(elements), chunk_size):
-        grouped.append([deepcopy(el) for el in elements[idx : idx + chunk_size]])
-    return grouped
 
 
 def _split_body_into_pages(body: ET.Element) -> List[List[ET.Element]]:
@@ -146,10 +156,10 @@ def _split_body_into_pages(body: ET.Element) -> List[List[ET.Element]]:
                 pages.append(current_page)
                 current_page = []
             segments = _split_paragraph(child)
-            for idx, segment in enumerate(segments):
+            for segment, has_break in segments:
                 if segment is not None:
                     current_page.append(segment)
-                if idx < len(segments) - 1:
+                if has_break:
                     pages.append(current_page)
                     current_page = []
         else:
@@ -168,8 +178,8 @@ def _has_page_break_before(paragraph: ET.Element) -> bool:
     return p_pr.find(qn("pageBreakBefore")) is not None
 
 
-def _split_paragraph(paragraph: ET.Element) -> List[ET.Element]:
-    segments: List[ET.Element] = []
+def _split_paragraph(paragraph: ET.Element) -> List[tuple[ET.Element | None, bool]]:
+    segments: List[tuple[ET.Element | None, bool]] = []
     current = _create_paragraph_shell(paragraph)
     has_content = False
 
@@ -177,17 +187,22 @@ def _split_paragraph(paragraph: ET.Element) -> List[ET.Element]:
         if child.tag == qn("pPr"):
             continue
         child_segments = _split_child(child)
-        for idx, (seg_element, has_break) in enumerate(child_segments):
+        for seg_element, has_break in child_segments:
             if seg_element is not None:
                 current.append(seg_element)
                 has_content = True
             if has_break:
-                segments.append(current)
+                if has_content:
+                    segments.append((current, True))
+                else:
+                    segments.append((None, True))
                 current = _create_paragraph_shell(paragraph)
                 has_content = False
 
-    if has_content or not segments:
-        segments.append(current)
+    if has_content:
+        segments.append((current, False))
+    elif not segments:
+        segments.append((current, False))
 
     return segments
 
@@ -248,3 +263,129 @@ def _is_page_break_element(element: ET.Element) -> bool:
         if element.get(qn("type")) == "page":
             return True
     return False
+
+
+class _DocxTemplate:
+    def __init__(
+        self,
+        *,
+        base_tree: ET.Element,
+        sect_pr: ET.Element | None,
+        static_files: Dict[str, bytes],
+        heavy_files: Dict[str, bytes],
+        relationships_root: ET.Element | None,
+    ) -> None:
+        self._base_tree = base_tree
+        self._sect_pr = sect_pr
+        self._static_files = static_files
+        self._heavy_files = heavy_files
+        self._relationships_root = relationships_root
+        self._relationships = self._parse_relationships(relationships_root)
+
+    def render(self, pages: Sequence[Sequence[ET.Element]]) -> bytes:
+        chunk_tree = deepcopy(self._base_tree)
+        chunk_body = chunk_tree.find(qn("body"))
+        if chunk_body is None:
+            raise DocxSplitError("문서 본문을 생성하지 못했습니다.")
+
+        for child in list(chunk_body):
+            chunk_body.remove(child)
+
+        for page in pages:
+            for element in page:
+                chunk_body.append(deepcopy(element))
+
+        if self._sect_pr is not None:
+            chunk_body.append(deepcopy(self._sect_pr))
+
+        chunk_xml = ET.tostring(chunk_tree, encoding="utf-8", xml_declaration=True)
+
+        used_relationships = _collect_relationship_ids(chunk_body)
+        rels_xml = self._build_relationships_xml(used_relationships)
+
+        buffer = BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, data in self._static_files.items():
+                archive.writestr(name, data)
+
+            for name in self._select_heavy_files(used_relationships):
+                archive.writestr(name, self._heavy_files[name])
+
+            archive.writestr("word/document.xml", chunk_xml)
+            if rels_xml is not None:
+                archive.writestr("word/_rels/document.xml.rels", rels_xml)
+
+        buffer.seek(0)
+        return buffer.getvalue()
+
+    def _build_relationships_xml(self, used_relationships: Set[str]) -> bytes | None:
+        if self._relationships_root is None:
+            return None
+
+        relationships_root = deepcopy(self._relationships_root)
+        for rel in list(relationships_root):
+            rel_id = rel.get("Id")
+            target = rel.get("Target", "")
+            if rel_id is None:
+                continue
+            if _is_size_heavy_target(target) and rel_id not in used_relationships:
+                relationships_root.remove(rel)
+
+        return ET.tostring(relationships_root, encoding="utf-8", xml_declaration=True)
+
+    def _select_heavy_files(self, used_relationships: Set[str]) -> Iterable[str]:
+        if not self._heavy_files:
+            return []
+
+        selected: Set[str] = set()
+        for rel_id in used_relationships:
+            target = self._relationships.get(rel_id)
+            if not target:
+                continue
+            path = _resolve_relationship_target(target)
+            if path in self._heavy_files:
+                selected.add(path)
+        return sorted(selected)
+
+    @staticmethod
+    def _parse_relationships(root: ET.Element | None) -> Dict[str, str]:
+        if root is None:
+            return {}
+
+        relationships: Dict[str, str] = {}
+        for rel in root.findall(f"{{{PKG_REL_NS}}}Relationship"):
+            rel_id = rel.get("Id")
+            target = rel.get("Target")
+            if rel_id and target:
+                relationships[rel_id] = target
+        return relationships
+
+
+def _collect_relationship_ids(element: ET.Element) -> Set[str]:
+    relationship_ids: Set[str] = set()
+    stack = [element]
+    while stack:
+        current = stack.pop()
+        for attrib_name, attrib_value in current.attrib.items():
+            if attrib_name.startswith(f"{{{R_NS}}}") and attrib_value:
+                relationship_ids.add(attrib_value)
+        stack.extend(list(current))
+    return relationship_ids
+
+
+def _resolve_relationship_target(target: str) -> str:
+    normalized = posixpath.normpath(posixpath.join("word", target))
+    return normalized
+
+
+def _is_size_heavy_target(target: str) -> bool:
+    lowered = target.lower()
+    heavy_prefixes = (
+        "media/",
+        "../media/",
+        "embeddings/",
+        "../embeddings/",
+        "charts/",
+        "../charts/",
+    )
+    return lowered.startswith(heavy_prefixes)

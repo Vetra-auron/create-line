@@ -113,17 +113,30 @@ def test_split_raises_for_invalid_target_size():
         split_docx_by_size(docx_bytes, target_size_mb=0, original_name="invalid.docx")
 
 
-def test_split_falls_back_to_even_grouping():
-    paragraphs = [build_paragraph(f"페이지 {idx}") for idx in range(4)]
+def test_split_limits_chunk_size_when_possible():
+    paragraphs = []
+    for idx in range(5):
+        include_break = idx < 4
+        text = f"페이지{idx} " + "A" * 2000
+        paragraphs.append(build_paragraph(text, include_page_break=include_break))
+
     docx_bytes = create_docx(paragraphs)
 
-    # 크기를 작게 지정하여 최소 두 개 이상의 청크가 생성되도록 합니다.
-    result = split_docx_by_size(docx_bytes, target_size_mb=0.0001, original_name="guide.docx")
+    target_size_mb = 0.0005
+    target_bytes = int(target_size_mb * 1024 * 1024)
 
+    result = split_docx_by_size(docx_bytes, target_size_mb=target_size_mb, original_name="guide.docx")
+
+    assert result.total_pages == 5
     assert len(result.chunks) >= 2
+
     combined_xml = "".join(extract_document_xml(chunk.data) for chunk in result.chunks)
-    for idx in range(4):
-        assert f"페이지 {idx}" in combined_xml
+    for idx in range(5):
+        assert f"페이지{idx}" in combined_xml
+
+    for chunk in result.chunks:
+        if chunk.start_page != chunk.end_page:
+            assert len(chunk.data) <= target_bytes
 
 
 def test_split_errors_when_document_missing(tmp_path):
