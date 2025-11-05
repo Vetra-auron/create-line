@@ -106,10 +106,9 @@ def split_docx_by_size(docx_bytes: bytes, target_size_mb: float, original_name: 
             f"최소 생성 용량은 약 {minimum_mb:.2f}MB입니다."
         )
 
-    current_pages: List[List[ET.Element]] = []
-    current_start = 1
-    cached_bytes: bytes | None = None
     requested_mb = target_bytes / (1024 * 1024)
+    total_pages = len(pages)
+    pad_width = max(2, len(str(total_pages)))
 
     def _raise_page_too_large(start: int, end: int, size_bytes: int) -> None:
         chunk_mb = size_bytes / (1024 * 1024)
@@ -122,53 +121,48 @@ def split_docx_by_size(docx_bytes: bytes, target_size_mb: float, original_name: 
             f"해당 범위만 분리해도 최소 약 {chunk_mb:.2f}MB가 필요합니다."
         )
 
-    for page_index, page in enumerate(pages, start=1):
-        candidate_pages = current_pages + [page]
-        candidate_bytes = template.render(candidate_pages)
+    page_index = 0
+    while page_index < total_pages:
+        remaining_pages = total_pages - page_index
+        low = 1
+        high = remaining_pages
+        best_count = 0
+        best_bytes: bytes | None = None
+        last_overflow_bytes: bytes | None = None
 
-        if len(candidate_bytes) > target_bytes:
-            if current_pages and len(candidate_pages) > 1:
-                start_page = current_start
-                end_page = current_start + len(current_pages) - 1
-                final_bytes = cached_bytes if cached_bytes is not None else template.render(current_pages)
-                if len(final_bytes) > target_bytes:
-                    _raise_page_too_large(start_page, end_page, len(final_bytes))
-                chunk_filename = f"{base_filename}_{start_page:02d}_{end_page:02d}.docx"
-                chunks.append(
-                    Chunk(
-                        filename=chunk_filename,
-                        data=final_bytes,
-                        start_page=start_page,
-                        end_page=end_page,
-                    )
-                )
-                current_pages = [page]
-                current_start = page_index
-                candidate_bytes = template.render(current_pages)
-                if len(candidate_bytes) > target_bytes:
-                    _raise_page_too_large(page_index, page_index, len(candidate_bytes))
+        while low <= high:
+            mid = (low + high) // 2
+            candidate_pages = pages[page_index : page_index + mid]
+            candidate_bytes = template.render(candidate_pages)
+            if len(candidate_bytes) <= target_bytes:
+                best_count = mid
+                best_bytes = candidate_bytes
+                low = mid + 1
             else:
-                _raise_page_too_large(page_index, page_index, len(candidate_bytes))
-        else:
-            current_pages = candidate_pages
+                last_overflow_bytes = candidate_bytes
+                high = mid - 1
 
-        cached_bytes = candidate_bytes
+        if best_count == 0:
+            overflow_bytes = last_overflow_bytes
+            if overflow_bytes is None:
+                overflow_bytes = template.render(pages[page_index : page_index + 1])
+            _raise_page_too_large(page_index + 1, page_index + 1, len(overflow_bytes))
 
-    if current_pages:
-        start_page = current_start
-        end_page = current_start + len(current_pages) - 1
-        final_bytes = cached_bytes if cached_bytes is not None else template.render(current_pages)
-        if len(final_bytes) > target_bytes:
-            _raise_page_too_large(start_page, end_page, len(final_bytes))
-        chunk_filename = f"{base_filename}_{start_page:02d}_{end_page:02d}.docx"
+        start_page = page_index + 1
+        end_page = page_index + best_count
+        if best_bytes is None:  # pragma: no cover - defensive guard
+            raise DocxSplitError("분할 결과를 생성하지 못했습니다.")
+
+        chunk_filename = f"{base_filename}_{start_page:0{pad_width}d}_{end_page:0{pad_width}d}.docx"
         chunks.append(
             Chunk(
                 filename=chunk_filename,
-                data=final_bytes,
+                data=best_bytes,
                 start_page=start_page,
                 end_page=end_page,
             )
         )
+        page_index += best_count
 
     return SplitResult(chunks=chunks, total_pages=len(pages), total_size=total_size)
 
