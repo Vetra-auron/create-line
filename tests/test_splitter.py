@@ -18,6 +18,8 @@ spec.loader.exec_module(splitter)
 
 split_docx_by_size = splitter.split_docx_by_size
 DocxSplitError = splitter.DocxSplitError
+_encode_png = splitter._encode_png
+_parse_png = splitter._parse_png
 
 
 CONTENT_TYPES = """<?xml version='1.0' encoding='UTF-8'?>
@@ -83,6 +85,17 @@ def create_docx(
                 archive.writestr(name, data)
     buffer.seek(0)
     return buffer.getvalue()
+
+
+def create_noisy_png(width: int, height: int) -> bytes:
+    channels = 3
+    raw = os.urandom(width * height * channels)
+    rows: list[list[int]] = []
+    for row_index in range(height):
+        start = row_index * width * channels
+        row_bytes = list(raw[start : start + width * channels])
+        rows.append(row_bytes)
+    return _encode_png(width, height, 8, 2, rows)
 
 
 def extract_document_xml(docx_bytes: bytes) -> str:
@@ -215,3 +228,135 @@ def test_split_errors_when_single_page_is_too_large():
     message = str(excinfo.value)
     assert "요청한 분할 용량" in message
     assert "페이지" in message
+
+
+def test_split_with_strip_strategy_removes_heavy_resources():
+    heavy_image = os.urandom(4 * 1024 * 1024)
+    paragraphs = [
+        (
+            "<w:p>"
+            "<w:r><w:t>이미지 페이지</w:t></w:r>"
+            "<w:r>"
+            "<w:drawing xmlns:wp='http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing' "
+            "xmlns:a='http://schemas.openxmlformats.org/drawingml/2006/main' "
+            "xmlns:pic='http://schemas.openxmlformats.org/drawingml/2006/picture'>"
+            "<wp:inline>"
+            "<a:graphic>"
+            "<a:graphicData uri='http://schemas.openxmlformats.org/drawingml/2006/picture'>"
+            "<pic:pic>"
+            "<pic:blipFill><a:blip r:embed='rIdImage1'/></pic:blipFill>"
+            "<pic:spPr/>"
+            "</pic:pic>"
+            "</a:graphicData>"
+            "</a:graphic>"
+            "</wp:inline>"
+            "</w:drawing>"
+            "</w:r>"
+            "<w:r><w:br w:type='page'/></w:r>"
+            "</w:p>"
+        ),
+        build_paragraph("텍스트 페이지"),
+    ]
+
+    rels_xml = """<?xml version='1.0' encoding='UTF-8'?>
+    <Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>
+      <Relationship Id='rIdImage1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/image' Target='media/image1.png'/>
+    </Relationships>
+    """
+
+    docx_bytes = create_docx(
+        paragraphs,
+        extra_files={
+            "word/_rels/document.xml.rels": rels_xml.encode("utf-8"),
+            "word/media/image1.png": heavy_image,
+        },
+    )
+
+    target_size_mb = 0.5
+    target_bytes = int(target_size_mb * 1024 * 1024)
+
+    result = split_docx_by_size(
+        docx_bytes,
+        target_size_mb=target_size_mb,
+        original_name="heavy.docx",
+        resource_strategy="strip",
+    )
+
+    assert result.total_pages == 2
+    first_chunk = result.chunks[0]
+    assert len(first_chunk.data) <= target_bytes
+    first_xml = extract_document_xml(first_chunk.data)
+    assert "w:drawing" not in first_xml
+
+    with zipfile.ZipFile(BytesIO(first_chunk.data)) as archive:
+        assert "word/media/image1.png" not in archive.namelist()
+
+
+def test_split_with_compress_strategy_reduces_image_size():
+    noisy_image = create_noisy_png(1600, 1600)
+    paragraphs = [
+        (
+            "<w:p>"
+            "<w:r><w:t>이미지 페이지</w:t></w:r>"
+            "<w:r>"
+            "<w:drawing xmlns:wp='http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing' "
+            "xmlns:a='http://schemas.openxmlformats.org/drawingml/2006/main' "
+            "xmlns:pic='http://schemas.openxmlformats.org/drawingml/2006/picture'>"
+            "<wp:inline>"
+            "<a:graphic>"
+            "<a:graphicData uri='http://schemas.openxmlformats.org/drawingml/2006/picture'>"
+            "<pic:pic>"
+            "<pic:blipFill><a:blip r:embed='rIdImage1'/></pic:blipFill>"
+            "<pic:spPr/>"
+            "</pic:pic>"
+            "</a:graphicData>"
+            "</a:graphic>"
+            "</wp:inline>"
+            "</w:drawing>"
+            "</w:r>"
+            "<w:r><w:br w:type='page'/></w:r>"
+            "</w:p>"
+        ),
+        build_paragraph("다음 페이지", include_page_break=False),
+    ]
+
+    rels_xml = """<?xml version='1.0' encoding='UTF-8'?>
+    <Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>
+      <Relationship Id='rIdImage1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/image' Target='media/image1.png'/>
+    </Relationships>
+    """
+
+    docx_bytes = create_docx(
+        paragraphs,
+        extra_files={
+            "word/_rels/document.xml.rels": rels_xml.encode("utf-8"),
+            "word/media/image1.png": noisy_image,
+        },
+    )
+
+    target_size_mb = 1.2
+
+    with pytest.raises(DocxSplitError):
+        split_docx_by_size(
+            docx_bytes,
+            target_size_mb=target_size_mb,
+            original_name="noise.docx",
+        )
+
+    result = split_docx_by_size(
+        docx_bytes,
+        target_size_mb=target_size_mb,
+        original_name="noise.docx",
+        resource_strategy="compress",
+        image_max_dimension=300,
+        jpeg_quality=60,
+    )
+
+    assert result.total_pages == 2
+    first_chunk = result.chunks[0]
+    assert len(first_chunk.data) <= int(target_size_mb * 1024 * 1024)
+
+    with zipfile.ZipFile(BytesIO(first_chunk.data)) as archive:
+        image_data = archive.read("word/media/image1.png")
+        processed_width, processed_height, _, _, _ = _parse_png(image_data)
+        assert max(processed_width, processed_height) <= 300

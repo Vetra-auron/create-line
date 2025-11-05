@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Set
 from xml.etree import ElementTree as ET
 from copy import deepcopy
+import struct
 import zipfile
+import zlib
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -37,13 +39,31 @@ class DocxSplitError(ValueError):
     """Raised when a DOCX file cannot be split."""
 
 
-def split_docx_by_size(docx_bytes: bytes, target_size_mb: float, original_name: str) -> SplitResult:
+def split_docx_by_size(
+    docx_bytes: bytes,
+    target_size_mb: float,
+    original_name: str,
+    *,
+    resource_strategy: str = "keep",
+    image_max_dimension: int = 1600,
+    jpeg_quality: int = 70,
+) -> SplitResult:
     if not docx_bytes:
         raise ValueError("빈 파일은 처리할 수 없습니다.")
 
     target_bytes = int(target_size_mb * 1024 * 1024)
     if target_bytes <= 0:
         raise ValueError("분할 기준이 되는 용량(MB)은 0보다 커야 합니다.")
+
+    normalized_strategy = resource_strategy.lower()
+    if normalized_strategy not in {"keep", "compress", "strip"}:
+        raise ValueError("지원하지 않는 리소스 처리 옵션입니다.")
+
+    if normalized_strategy == "compress":
+        if image_max_dimension <= 0:
+            raise ValueError("이미지 최대 해상도는 0보다 커야 합니다.")
+        if not 1 <= jpeg_quality <= 95:
+            raise ValueError("JPEG 품질은 1에서 95 사이의 값으로 지정해주세요.")
 
     try:
         with zipfile.ZipFile(BytesIO(docx_bytes)) as docx_zip:
@@ -94,6 +114,9 @@ def split_docx_by_size(docx_bytes: bytes, target_size_mb: float, original_name: 
         static_files=static_files,
         heavy_files=heavy_files,
         relationships_root=relationships_root,
+        resource_strategy=normalized_strategy,
+        image_max_dimension=image_max_dimension,
+        jpeg_quality=jpeg_quality,
     )
 
     minimum_chunk_size = len(template.render([]))
@@ -295,6 +318,9 @@ class _DocxTemplate:
         static_files: Dict[str, bytes],
         heavy_files: Dict[str, bytes],
         relationships_root: ET.Element | None,
+        resource_strategy: str,
+        image_max_dimension: int,
+        jpeg_quality: int,
     ) -> None:
         self._base_tree = base_tree
         self._sect_pr = sect_pr
@@ -302,6 +328,15 @@ class _DocxTemplate:
         self._heavy_files = heavy_files
         self._relationships_root = relationships_root
         self._relationships = self._parse_relationships(relationships_root)
+        self._resource_strategy = resource_strategy
+        self._image_max_dimension = image_max_dimension
+        self._jpeg_quality = jpeg_quality
+        self._heavy_relationship_ids: Set[str] = {
+            rel_id
+            for rel_id, target in self._relationships.items()
+            if _is_size_heavy_target(target)
+        }
+        self._heavy_cache: Dict[str, bytes] = {}
 
     def render(self, pages: Sequence[Sequence[ET.Element]]) -> bytes:
         chunk_tree = deepcopy(self._base_tree)
@@ -319,9 +354,15 @@ class _DocxTemplate:
         if self._sect_pr is not None:
             chunk_body.append(deepcopy(self._sect_pr))
 
+        removed_heavy_relationships: Set[str] = set()
+        if self._resource_strategy == "strip" and self._heavy_relationship_ids:
+            removed_heavy_relationships = self._strip_heavy_relationships(chunk_body)
+
         chunk_xml = ET.tostring(chunk_tree, encoding="utf-8", xml_declaration=True)
 
         used_relationships = _collect_relationship_ids(chunk_body)
+        if removed_heavy_relationships:
+            used_relationships -= removed_heavy_relationships
         rels_xml = self._build_relationships_xml(used_relationships)
 
         buffer = BytesIO()
@@ -330,7 +371,9 @@ class _DocxTemplate:
                 archive.writestr(name, data)
 
             for name in self._select_heavy_files(used_relationships):
-                archive.writestr(name, self._heavy_files[name])
+                heavy_bytes = self._get_heavy_file_bytes(name)
+                if heavy_bytes is not None:
+                    archive.writestr(name, heavy_bytes)
 
             archive.writestr("word/document.xml", chunk_xml)
             if rels_xml is not None:
@@ -368,6 +411,39 @@ class _DocxTemplate:
                 selected.add(path)
         return sorted(selected)
 
+    def _strip_heavy_relationships(self, parent: ET.Element) -> Set[str]:
+        removed: Set[str] = set()
+        for child in list(parent):
+            removed |= self._strip_heavy_relationships(child)
+            referenced = _collect_specific_relationship_ids(child, self._heavy_relationship_ids)
+            if referenced:
+                parent.remove(child)
+                removed |= referenced
+        return removed
+
+    def _get_heavy_file_bytes(self, name: str) -> bytes | None:
+        if self._resource_strategy == "strip":
+            return None
+
+        if self._resource_strategy != "compress":
+            return self._heavy_files[name]
+
+        if name in self._heavy_cache:
+            return self._heavy_cache[name]
+
+        original = self._heavy_files[name]
+        processed = self._compress_heavy_file(name, original)
+        self._heavy_cache[name] = processed
+        return processed
+
+    def _compress_heavy_file(self, name: str, data: bytes) -> bytes:
+        lowered = name.lower()
+        if lowered.endswith(".png"):
+            compressed = _downscale_png_bytes(data, self._image_max_dimension)
+            if compressed is not None and len(compressed) < len(data):
+                return compressed
+        return data
+
     @staticmethod
     def _parse_relationships(root: ET.Element | None) -> Dict[str, str]:
         if root is None:
@@ -394,6 +470,21 @@ def _collect_relationship_ids(element: ET.Element) -> Set[str]:
     return relationship_ids
 
 
+def _collect_specific_relationship_ids(element: ET.Element, targets: Set[str]) -> Set[str]:
+    if not targets:
+        return set()
+
+    matched: Set[str] = set()
+    for attrib_name, attrib_value in element.attrib.items():
+        if attrib_name.startswith(f"{{{R_NS}}}") and attrib_value in targets:
+            matched.add(attrib_value)
+
+    for child in element:
+        matched |= _collect_specific_relationship_ids(child, targets)
+
+    return matched
+
+
 def _resolve_relationship_target(target: str) -> str:
     normalized = posixpath.normpath(posixpath.join("word", target))
     return normalized
@@ -410,3 +501,175 @@ def _is_size_heavy_target(target: str) -> bool:
         "../charts/",
     )
     return lowered.startswith(heavy_prefixes)
+
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def _downscale_png_bytes(data: bytes, max_dimension: int) -> bytes | None:
+    if max_dimension <= 0:
+        return None
+
+    try:
+        width, height, bit_depth, color_type, rows = _parse_png(data)
+    except ValueError:
+        return None
+
+    if max(width, height) <= max_dimension:
+        return None
+
+    new_width, new_height, new_rows = _resize_png_rows(rows, width, height, color_type, max_dimension)
+    return _encode_png(new_width, new_height, bit_depth, color_type, new_rows)
+
+
+def _parse_png(data: bytes) -> tuple[int, int, int, int, List[List[int]]]:
+    if not data.startswith(PNG_SIGNATURE):
+        raise ValueError("PNG 시그니처가 올바르지 않습니다.")
+
+    stream = memoryview(data)
+    pos = len(PNG_SIGNATURE)
+    width = height = bit_depth = color_type = None
+    idat_parts: List[bytes] = []
+
+    while pos + 8 <= len(stream):
+        length = struct.unpack(">I", stream[pos : pos + 4])[0]
+        pos += 4
+        chunk_type = bytes(stream[pos : pos + 4])
+        pos += 4
+        chunk_data = bytes(stream[pos : pos + length])
+        pos += length
+        pos += 4  # skip CRC
+
+        if chunk_type == b"IHDR":
+            if length != 13:
+                raise ValueError("IHDR 길이가 올바르지 않습니다.")
+            width, height, bit_depth, color_type, compression, filter_method, interlace = struct.unpack(
+                ">IIBBBBB", chunk_data
+            )
+            if bit_depth != 8 or compression != 0 or filter_method != 0 or interlace != 0:
+                raise ValueError("지원하지 않는 PNG 압축 형식입니다.")
+            if color_type not in (2, 6):
+                raise ValueError("RGB 혹은 RGBA PNG만 지원합니다.")
+        elif chunk_type == b"IDAT":
+            idat_parts.append(chunk_data)
+        elif chunk_type == b"IEND":
+            break
+
+    if not idat_parts or width is None or height is None or bit_depth is None or color_type is None:
+        raise ValueError("PNG 데이터를 해석할 수 없습니다.")
+
+    decompressed = zlib.decompress(b"".join(idat_parts))
+    channels = 4 if color_type == 6 else 3
+    stride = width * channels
+    expected = (stride + 1) * height
+    if len(decompressed) != expected:
+        raise ValueError("PNG 데이터 길이가 예상과 다릅니다.")
+
+    rows: List[List[int]] = []
+    prev_row = [0] * stride
+    offset = 0
+    for _ in range(height):
+        filter_type = decompressed[offset]
+        offset += 1
+        row_bytes = list(decompressed[offset : offset + stride])
+        offset += stride
+        row = _apply_png_filter(filter_type, row_bytes, prev_row, channels)
+        rows.append(row)
+        prev_row = row
+
+    return width, height, bit_depth, color_type, rows
+
+
+def _apply_png_filter(filter_type: int, raw_row: List[int], prev_row: List[int], channels: int) -> List[int]:
+    if filter_type == 0:
+        return raw_row
+
+    row = [0] * len(raw_row)
+    if filter_type == 1:
+        for idx, value in enumerate(raw_row):
+            left = row[idx - channels] if idx >= channels else 0
+            row[idx] = (value + left) & 0xFF
+    elif filter_type == 2:
+        for idx, value in enumerate(raw_row):
+            up = prev_row[idx]
+            row[idx] = (value + up) & 0xFF
+    elif filter_type == 3:
+        for idx, value in enumerate(raw_row):
+            left = row[idx - channels] if idx >= channels else 0
+            up = prev_row[idx]
+            row[idx] = (value + ((left + up) // 2)) & 0xFF
+    elif filter_type == 4:
+        for idx, value in enumerate(raw_row):
+            left = row[idx - channels] if idx >= channels else 0
+            up = prev_row[idx]
+            up_left = prev_row[idx - channels] if idx >= channels else 0
+            row[idx] = (value + _paeth_predictor(left, up, up_left)) & 0xFF
+    else:  # pragma: no cover - unexpected filter type
+        raise ValueError("지원하지 않는 PNG 필터 유형입니다.")
+    return row
+
+
+def _encode_png(width: int, height: int, bit_depth: int, color_type: int, rows: List[List[int]]) -> bytes:
+    channels = 4 if color_type == 6 else 3
+    stride = width * channels
+    raw = bytearray()
+    for row in rows:
+        if len(row) != stride:
+            raise ValueError("PNG 행 길이가 일치하지 않습니다.")
+        raw.append(0)
+        raw.extend(row)
+
+    compressed = zlib.compress(bytes(raw), level=9)
+    parts = [PNG_SIGNATURE]
+    ihdr = struct.pack(">IIBBBBB", width, height, bit_depth, color_type, 0, 0, 0)
+    parts.append(_png_chunk(b"IHDR", ihdr))
+    parts.append(_png_chunk(b"IDAT", compressed))
+    parts.append(_png_chunk(b"IEND", b""))
+    return b"".join(parts)
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    length = struct.pack(">I", len(data))
+    crc = struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
+    return length + chunk_type + data + crc
+
+
+def _resize_png_rows(
+    rows: List[List[int]],
+    width: int,
+    height: int,
+    color_type: int,
+    max_dimension: int,
+) -> tuple[int, int, List[List[int]]]:
+    channels = 4 if color_type == 6 else 3
+    ratio = max(width, height) / max_dimension
+    new_width = max(1, int(width / ratio))
+    new_height = max(1, int(height / ratio))
+    x_scale = width / new_width
+    y_scale = height / new_height
+
+    resized: List[List[int]] = []
+    for new_y in range(new_height):
+        src_y = min(height - 1, int(new_y * y_scale))
+        src_row = rows[src_y]
+        new_row: List[int] = []
+        for new_x in range(new_width):
+            src_x = min(width - 1, int(new_x * x_scale))
+            start = src_x * channels
+            new_row.extend(src_row[start : start + channels])
+        resized.append(new_row)
+
+    return new_width, new_height, resized
+
+
+def _paeth_predictor(left: int, up: int, up_left: int) -> int:
+    # Implementation based on PNG specification.
+    p = left + up - up_left
+    pa = abs(p - left)
+    pb = abs(p - up)
+    pc = abs(p - up_left)
+    if pa <= pb and pa <= pc:
+        return left
+    if pb <= pc:
+        return up
+    return up_left
