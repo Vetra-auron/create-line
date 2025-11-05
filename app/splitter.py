@@ -109,31 +109,46 @@ def split_docx_by_size(docx_bytes: bytes, target_size_mb: float, original_name: 
     current_pages: List[List[ET.Element]] = []
     current_start = 1
     cached_bytes: bytes | None = None
+    requested_mb = target_bytes / (1024 * 1024)
+
+    def _raise_page_too_large(start: int, end: int, size_bytes: int) -> None:
+        chunk_mb = size_bytes / (1024 * 1024)
+        if start == end:
+            page_label = f"{start}페이지"
+        else:
+            page_label = f"{start}-{end}페이지 범위"
+        raise DocxSplitError(
+            f"{page_label}에 포함된 리소스 용량이 커서 요청한 분할 용량({requested_mb:.2f}MB)을 초과합니다. "
+            f"해당 범위만 분리해도 최소 약 {chunk_mb:.2f}MB가 필요합니다."
+        )
 
     for page_index, page in enumerate(pages, start=1):
         candidate_pages = current_pages + [page]
         candidate_bytes = template.render(candidate_pages)
 
-        if (
-            current_pages
-            and len(candidate_pages) > 1
-            and len(candidate_bytes) > target_bytes
-        ):
-            start_page = current_start
-            end_page = current_start + len(current_pages) - 1
-            final_bytes = cached_bytes if cached_bytes is not None else template.render(current_pages)
-            chunk_filename = f"{base_filename}_{start_page:02d}_{end_page:02d}.docx"
-            chunks.append(
-                Chunk(
-                    filename=chunk_filename,
-                    data=final_bytes,
-                    start_page=start_page,
-                    end_page=end_page,
+        if len(candidate_bytes) > target_bytes:
+            if current_pages and len(candidate_pages) > 1:
+                start_page = current_start
+                end_page = current_start + len(current_pages) - 1
+                final_bytes = cached_bytes if cached_bytes is not None else template.render(current_pages)
+                if len(final_bytes) > target_bytes:
+                    _raise_page_too_large(start_page, end_page, len(final_bytes))
+                chunk_filename = f"{base_filename}_{start_page:02d}_{end_page:02d}.docx"
+                chunks.append(
+                    Chunk(
+                        filename=chunk_filename,
+                        data=final_bytes,
+                        start_page=start_page,
+                        end_page=end_page,
+                    )
                 )
-            )
-            current_pages = [page]
-            current_start = page_index
-            candidate_bytes = template.render(current_pages)
+                current_pages = [page]
+                current_start = page_index
+                candidate_bytes = template.render(current_pages)
+                if len(candidate_bytes) > target_bytes:
+                    _raise_page_too_large(page_index, page_index, len(candidate_bytes))
+            else:
+                _raise_page_too_large(page_index, page_index, len(candidate_bytes))
         else:
             current_pages = candidate_pages
 
@@ -143,6 +158,8 @@ def split_docx_by_size(docx_bytes: bytes, target_size_mb: float, original_name: 
         start_page = current_start
         end_page = current_start + len(current_pages) - 1
         final_bytes = cached_bytes if cached_bytes is not None else template.render(current_pages)
+        if len(final_bytes) > target_bytes:
+            _raise_page_too_large(start_page, end_page, len(final_bytes))
         chunk_filename = f"{base_filename}_{start_page:02d}_{end_page:02d}.docx"
         chunks.append(
             Chunk(

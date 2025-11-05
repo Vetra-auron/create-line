@@ -24,6 +24,7 @@ CONTENT_TYPES = """<?xml version='1.0' encoding='UTF-8'?>
 <Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'>
   <Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/>
   <Default Extension='xml' ContentType='application/xml'/>
+  <Default Extension='png' ContentType='image/png'/>
   <Override PartName='/word/document.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/>
 </Types>
 """
@@ -59,14 +60,18 @@ def build_document_xml(paragraphs: list[str]) -> bytes:
     body = "".join(paragraphs) + SECT_PR
     xml = (
         "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>"
-        "<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        "<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main' "
+        "xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships'>"
         f"<w:body>{body}</w:body>"
         "</w:document>"
     )
     return xml.encode("utf-8")
 
 
-def create_docx(paragraphs: list[str], extra_files: dict[str, bytes] | None = None) -> bytes:
+def create_docx(
+    paragraphs: list[str],
+    extra_files: dict[str, bytes] | None = None,
+) -> bytes:
     document_xml = build_document_xml(paragraphs)
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -160,3 +165,53 @@ def test_split_errors_when_static_overhead_exceeds_target():
 
     message = str(excinfo.value)
     assert "최소 생성 용량" in message
+
+
+def test_split_errors_when_single_page_is_too_large():
+    heavy_image = os.urandom(4 * 1024 * 1024)
+    paragraphs = [
+        (
+            "<w:p>"
+            "<w:r><w:t>이미지 페이지</w:t></w:r>"
+            "<w:r>"
+            "<w:drawing xmlns:wp='http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing' "
+            "xmlns:a='http://schemas.openxmlformats.org/drawingml/2006/main' "
+            "xmlns:pic='http://schemas.openxmlformats.org/drawingml/2006/picture'>"
+            "<wp:inline>"
+            "<a:graphic>"
+            "<a:graphicData uri='http://schemas.openxmlformats.org/drawingml/2006/picture'>"
+            "<pic:pic>"
+            "<pic:blipFill><a:blip r:embed='rIdImage1'/></pic:blipFill>"
+            "<pic:spPr/>"
+            "</pic:pic>"
+            "</a:graphicData>"
+            "</a:graphic>"
+            "</wp:inline>"
+            "</w:drawing>"
+            "</w:r>"
+            "<w:r><w:br w:type='page'/></w:r>"
+            "</w:p>"
+        ),
+        build_paragraph("텍스트 페이지"),
+    ]
+
+    rels_xml = """<?xml version='1.0' encoding='UTF-8'?>
+    <Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>
+      <Relationship Id='rIdImage1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/image' Target='media/image1.png'/>
+    </Relationships>
+    """
+
+    docx_bytes = create_docx(
+        paragraphs,
+        extra_files={
+            "word/_rels/document.xml.rels": rels_xml.encode("utf-8"),
+            "word/media/image1.png": heavy_image,
+        },
+    )
+
+    with pytest.raises(DocxSplitError) as excinfo:
+        split_docx_by_size(docx_bytes, target_size_mb=0.5, original_name="heavy.docx")
+
+    message = str(excinfo.value)
+    assert "요청한 분할 용량" in message
+    assert "페이지" in message
