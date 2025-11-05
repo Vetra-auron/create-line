@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import sys
 from pathlib import Path
 import zipfile
@@ -65,13 +66,16 @@ def build_document_xml(paragraphs: list[str]) -> bytes:
     return xml.encode("utf-8")
 
 
-def create_docx(paragraphs: list[str]) -> bytes:
+def create_docx(paragraphs: list[str], extra_files: dict[str, bytes] | None = None) -> bytes:
     document_xml = build_document_xml(paragraphs)
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("[Content_Types].xml", CONTENT_TYPES)
         archive.writestr("_rels/.rels", RELS)
         archive.writestr("word/document.xml", document_xml)
+        if extra_files:
+            for name, data in extra_files.items():
+                archive.writestr(name, data)
     buffer.seek(0)
     return buffer.getvalue()
 
@@ -84,12 +88,12 @@ def extract_document_xml(docx_bytes: bytes) -> str:
 def test_split_uses_page_breaks_for_chunk_boundaries(tmp_path):
     docx_bytes = create_docx(
         [
-            build_paragraph("첫 번째 페이지", include_page_break=True),
-            build_paragraph("두 번째 페이지"),
+            build_paragraph("첫 번째 페이지" + "A" * 4000, include_page_break=True),
+            build_paragraph("두 번째 페이지" + "B" * 4000),
         ]
     )
 
-    result = split_docx_by_size(docx_bytes, target_size_mb=0.0001, original_name="매뉴얼.docx")
+    result = split_docx_by_size(docx_bytes, target_size_mb=0.00102, original_name="매뉴얼.docx")
 
     assert result.total_pages == 2
     assert len(result.chunks) == 2
@@ -122,7 +126,7 @@ def test_split_limits_chunk_size_when_possible():
 
     docx_bytes = create_docx(paragraphs)
 
-    target_size_mb = 0.0005
+    target_size_mb = 0.00102
     target_bytes = int(target_size_mb * 1024 * 1024)
 
     result = split_docx_by_size(docx_bytes, target_size_mb=target_size_mb, original_name="guide.docx")
@@ -142,3 +146,17 @@ def test_split_limits_chunk_size_when_possible():
 def test_split_errors_when_document_missing(tmp_path):
     with pytest.raises(DocxSplitError):
         split_docx_by_size(b"not-a-zip", target_size_mb=1, original_name="broken.docx")
+
+
+def test_split_errors_when_static_overhead_exceeds_target():
+    large_font = os.urandom(5 * 1024 * 1024)
+    docx_bytes = create_docx(
+        [build_paragraph("폰트가 포함된 문서")],
+        extra_files={"word/fonts/font1.odttf": large_font},
+    )
+
+    with pytest.raises(DocxSplitError) as excinfo:
+        split_docx_by_size(docx_bytes, target_size_mb=1, original_name="font.docx")
+
+    message = str(excinfo.value)
+    assert "최소 생성 용량" in message

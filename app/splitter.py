@@ -96,6 +96,16 @@ def split_docx_by_size(docx_bytes: bytes, target_size_mb: float, original_name: 
         relationships_root=relationships_root,
     )
 
+    minimum_chunk_size = len(template.render([]))
+    if minimum_chunk_size > target_bytes:
+        minimum_mb = minimum_chunk_size / (1024 * 1024)
+        requested_mb = target_bytes / (1024 * 1024)
+        raise DocxSplitError(
+            "문서에 포함된 필수 리소스(폰트, 스타일 등)의 용량이 크기 때문에 "
+            f"요청한 분할 용량({requested_mb:.2f}MB)보다 작은 파일을 만들 수 없습니다. "
+            f"최소 생성 용량은 약 {minimum_mb:.2f}MB입니다."
+        )
+
     current_pages: List[List[ET.Element]] = []
     current_start = 1
     cached_bytes: bytes | None = None
