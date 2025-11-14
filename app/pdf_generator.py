@@ -12,12 +12,26 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 
 from .models import QuoteDocument, QuoteItem
 
+DEFAULT_FONT = "HYGoThic-Medium"
+DEFAULT_BOLD_FONT = "HYSMyeongJo-Medium"
+
+
+def _ensure_fonts_registered() -> None:
+    """보고서에 사용할 한글 폰트를 등록한다."""
+
+    for font_name in {DEFAULT_FONT, DEFAULT_BOLD_FONT}:
+        if font_name not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(UnicodeCIDFont(font_name))
+
 
 def _build_items_table(items: Iterable[QuoteItem]):
+    _ensure_fonts_registered()
     header = ["품명", "Model No.", "수량", "단위", "단가", "금액"]
     data = [header] + [item.to_row() for item in items]
 
@@ -28,9 +42,10 @@ def _build_items_table(items: Iterable[QuoteItem]):
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
             ("ALIGN", (2, 1), (-1, -1), "CENTER"),
             ("ALIGN", (4, 1), (-1, -1), "RIGHT"),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTNAME", (0, 0), (-1, 0), DEFAULT_BOLD_FONT),
             ("FONTSIZE", (0, 0), (-1, 0), 11),
             ("FONTSIZE", (0, 1), (-1, -1), 10),
+            ("FONTNAME", (0, 1), (-1, -1), DEFAULT_FONT),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
             ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
         ]
@@ -42,19 +57,36 @@ def _build_items_table(items: Iterable[QuoteItem]):
 def generate_pdf(document: QuoteDocument, output_path: Path) -> Path:
     """QuoteDocument 데이터를 기반으로 PDF를 생성한다."""
 
+    _ensure_fonts_registered()
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     doc = SimpleDocTemplate(str(output_path), pagesize=A4, rightMargin=20 * mm, leftMargin=20 * mm)
     styles = getSampleStyleSheet()
-    normal = styles["Normal"]
-    bold = ParagraphStyle("Bold", parent=normal, fontName="Helvetica-Bold", fontSize=14)
+    normal = ParagraphStyle(
+        "KoreanNormal",
+        parent=styles["Normal"],
+        fontName=DEFAULT_FONT,
+        fontSize=11,
+        leading=16,
+    )
+    bold = ParagraphStyle("Bold", parent=normal, fontName=DEFAULT_BOLD_FONT, fontSize=14)
 
     elements = []
-    elements.append(Paragraph("견적서", ParagraphStyle("Title", parent=bold, alignment=1, fontSize=18)))
+    elements.append(
+        Paragraph(
+            "견적서",
+            ParagraphStyle(
+                "Title",
+                parent=bold,
+                alignment=1,
+                fontSize=18,
+            ),
+        )
+    )
     elements.append(Spacer(1, 6 * mm))
 
-    info_style = ParagraphStyle("Info", parent=normal, fontSize=11, leading=16)
+    info_style = ParagraphStyle("Info", parent=normal)
     info_text = (
         f"<b>업체명:</b> {document.company_name}<br/>"
         f"<b>날짜:</b> {document.quotation_date.strftime('%Y-%m-%d')}"
@@ -65,7 +97,7 @@ def generate_pdf(document: QuoteDocument, output_path: Path) -> Path:
     elements.append(_build_items_table(document.items))
     elements.append(Spacer(1, 6 * mm))
 
-    total_style = ParagraphStyle("Total", parent=normal, fontSize=12, alignment=2)
+    total_style = ParagraphStyle("Total", parent=normal, fontSize=12, alignment=2, fontName=DEFAULT_BOLD_FONT)
     elements.append(Paragraph(f"합계: {document.total_amount:,.0f} 원", total_style))
     elements.append(Spacer(1, 6 * mm))
 
