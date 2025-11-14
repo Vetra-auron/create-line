@@ -30,7 +30,7 @@ class QuoteApp:
         self.item_name_var = tk.StringVar()
         self.model_var = tk.StringVar()
         self.quantity_var = tk.StringVar()
-        self.unit_var = tk.StringVar()
+        self.unit_var = tk.StringVar(value="Set")
         self.unit_price_var = tk.StringVar()
         self.amount_var = tk.StringVar()
 
@@ -77,11 +77,26 @@ class QuoteApp:
             self.unit_price_var,
             self.amount_var,
         ]
-        widths = [30, 20, 8, 8, 12, 12]
+        widths = [30, 20, 8, 10, 12, 12]
 
         for idx, (label, var, width) in enumerate(zip(labels, variables, widths)):
             ttk.Label(form_frame, text=label).grid(row=0, column=idx, sticky=tk.W, padx=4, pady=4)
-            ttk.Entry(form_frame, textvariable=var, width=width).grid(row=1, column=idx, sticky=tk.W, padx=4, pady=4)
+            if label == "단위":
+                ttk.Combobox(
+                    form_frame,
+                    textvariable=self.unit_var,
+                    values=["Set", "Pair"],
+                    state="readonly",
+                    width=width,
+                ).grid(row=1, column=idx, sticky=tk.W, padx=4, pady=4)
+            elif label == "금액":
+                ttk.Entry(form_frame, textvariable=var, width=width, state="readonly").grid(
+                    row=1, column=idx, sticky=tk.W, padx=4, pady=4
+                )
+            else:
+                ttk.Entry(form_frame, textvariable=var, width=width).grid(
+                    row=1, column=idx, sticky=tk.W, padx=4, pady=4
+                )
 
         button_frame = ttk.Frame(form_frame)
         button_frame.grid(row=1, column=len(labels), padx=8)
@@ -101,7 +116,20 @@ class QuoteApp:
             "unit_price": "단가",
             "amount": "금액",
         }
-        widths = {
+
+        style = ttk.Style(self.root)
+        style.configure("Treeview.Heading", font=("Helvetica", 10, "bold"))
+
+        self._tree_width_ratios = {
+            "name": 0.28,
+            "model": 0.21,
+            "qty": 0.12,
+            "unit": 0.12,
+            "unit_price": 0.13,
+            "amount": 0.14,
+        }
+
+        default_widths = {
             "name": 200,
             "model": 150,
             "qty": 80,
@@ -112,13 +140,21 @@ class QuoteApp:
 
         for key in columns:
             self.tree.heading(key, text=headings[key])
-            self.tree.column(key, width=widths[key], anchor=tk.CENTER if key in {"qty", "unit"} else tk.W)
+            anchor = tk.CENTER if key in {"qty", "unit"} else tk.W
+            if key in {"unit_price", "amount"}:
+                anchor = tk.E
+            self.tree.column(key, width=default_widths[key], anchor=anchor, stretch=True)
+
+        self.tree.bind("<Configure>", self._resize_tree_columns)
 
         self.total_var = tk.StringVar(value="0")
         total_frame = ttk.Frame(frame)
         total_frame.pack(fill=tk.X, pady=(8, 0))
         ttk.Label(total_frame, text="합계:", font=("Helvetica", 12, "bold")).pack(side=tk.RIGHT)
         ttk.Label(total_frame, textvariable=self.total_var, font=("Helvetica", 12, "bold")).pack(side=tk.RIGHT, padx=(0, 20))
+
+        self.quantity_var.trace_add("write", lambda *_: self._update_amount_field())
+        self.unit_price_var.trace_add("write", lambda *_: self._update_amount_field())
 
     def _build_cause_repair_frame(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="원인 및 수리 내역", padding=12)
@@ -169,21 +205,18 @@ class QuoteApp:
             messagebox.showerror("입력 오류", "단가는 숫자로 입력해주세요.")
             return
 
-        amount_text = self.amount_var.get().strip()
-        if amount_text:
-            try:
-                amount = float(amount_text.replace(",", ""))
-            except ValueError:
-                messagebox.showerror("입력 오류", "금액은 숫자로 입력해주세요.")
-                return
-        else:
-            amount = unit_price * quantity
+        amount = unit_price * quantity
+
+        unit_value = self.unit_var.get().strip()
+        if not unit_value:
+            messagebox.showerror("입력 오류", "단위를 선택해주세요.")
+            return
 
         item = QuoteItem(
             name=self.item_name_var.get().strip(),
             model_no=self.model_var.get().strip(),
             quantity=quantity,
-            unit=self.unit_var.get().strip(),
+            unit=unit_value,
             unit_price=unit_price,
             amount=amount,
         )
@@ -218,16 +251,40 @@ class QuoteApp:
 
         self.total_var.set(f"{sum(item.amount for item in self.items):,.0f} 원")
 
+    def _resize_tree_columns(self, event: tk.Event) -> None:
+        if not hasattr(self, "_tree_width_ratios"):
+            return
+
+        total_width = max(event.width, 1)
+        for key, ratio in self._tree_width_ratios.items():
+            width = int(total_width * ratio)
+            if width > 0:
+                self.tree.column(key, width=width)
+
+    def _update_amount_field(self) -> None:
+        quantity_text = self.quantity_var.get().strip()
+        unit_price_text = self.unit_price_var.get().strip().replace(",", "")
+
+        try:
+            quantity = int(quantity_text)
+            unit_price = float(unit_price_text)
+        except ValueError:
+            self.amount_var.set("")
+            return
+
+        amount = quantity * unit_price
+        self.amount_var.set(f"{amount:,.0f}")
+
     def _clear_item_inputs(self) -> None:
         for var in [
             self.item_name_var,
             self.model_var,
             self.quantity_var,
-            self.unit_var,
             self.unit_price_var,
-            self.amount_var,
         ]:
             var.set("")
+        self.unit_var.set("Set")
+        self.amount_var.set("")
 
     # Document handling -----------------------------------------------
     def _collect_document(self) -> QuoteDocument:
