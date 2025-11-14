@@ -24,6 +24,12 @@ pip install -r requirements.txt
 python -m app.main
 ```
 
+또는 가상 환경을 활성화한 상태에서 다음과 같이 직접 실행할 수도 있습니다.
+
+```bash
+python app/main.py
+```
+
 ## PDF 생성 및 인쇄
 
 1. 기본 정보와 품목, 원인·수리 정보를 입력합니다.
